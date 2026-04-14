@@ -1,3 +1,5 @@
+# Video Mask Annotation Tool
+
 ## 🎯 Overview
 
 A Python library for launching a Gradio interface to create video masks using either click-based interaction or text prompts.
