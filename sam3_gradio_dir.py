@@ -50,14 +50,18 @@ COLOR_PALETTE = [
 
 W = 768
 H = W
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "SAM3 text/video inference in this app requires CUDA, but no CUDA GPU is available."
+    )
+DEVICE = "cuda"
 
-if DEVICE == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
+if torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-MASK_SAVE_ROOT = APP_ROOT / "masks"
-INPUT_CLIPS_DIR = APP_ROOT / "clips_ytambi_h264"
+MASK_SAVE_ROOT = APP_ROOT / "masks_h264"
+INPUT_CLIPS_DIR = APP_ROOT / "clips_h264"
 VIDEO_PATHS = [path for path in sorted(INPUT_CLIPS_DIR.glob("*")) if path.is_file()]
 if not VIDEO_PATHS:
     raise FileNotFoundError(f"No videos found in {INPUT_CLIPS_DIR}")
@@ -96,6 +100,10 @@ def resize_frame(frame):
     else:
         out_h = H
         out_w = int(out_h * frame.shape[1] / frame.shape[0])
+
+    # libx264 requires even frame dimensions.
+    out_w = max(2, out_w - (out_w % 2))
+    out_h = max(2, out_h - (out_h % 2))
     resized = cv2.resize(frame, (out_w, out_h))
     return resized, out_w, out_h
 
@@ -145,6 +153,14 @@ def get_video_title(video_idx):
     return f"{video_idx + 1}/{len(VIDEO_PATHS)}: {VIDEO_PATHS[video_idx].name}"
 
 
+def get_video_selector_label(video_idx):
+    return f"{video_idx + 1}: {VIDEO_PATHS[video_idx].name}"
+
+
+def get_video_selector_choices():
+    return [get_video_selector_label(video_idx) for video_idx in range(len(VIDEO_PATHS))]
+
+
 def current_preview_image(video_state):
     if video_state["origin_images"]:
         return Image.fromarray(video_state["origin_images"][0])
@@ -179,6 +195,17 @@ def read_display_frames(video_path, n_frames=None):
     return [resize_frame(frame)[0] for frame in frames]
 
 
+def get_video_fps(video_path):
+    vr = VideoReader(video_path, ctx=cpu(0))
+    try:
+        fps = float(vr.get_avg_fps())
+    finally:
+        del vr
+    if not np.isfinite(fps) or fps <= 0:
+        return 15.0
+    return fps
+
+
 def combine_output_masks(outputs):
     out_binary_masks = outputs.get("out_binary_masks")
     if out_binary_masks is None:
@@ -193,10 +220,40 @@ def combine_output_masks(outputs):
     return np.any(masks.astype(bool), axis=0).astype(np.float32)
 
 
+def find_text_query_seed_frame(inference_state, prompt):
+    predictor = get_text_predictor()
+    num_frames = int(inference_state["num_frames"])
+
+    for frame_idx in range(num_frames):
+        _, outputs = predictor.add_prompt(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            text_str=prompt,
+        )
+        mask = combine_output_masks(outputs)
+        if mask is not None:
+            return frame_idx, mask
+
+    return None, None
+
+
 def write_preview_video(frames, fps=15):
     video_file = GRADIO_TEMP_DIR / f"{time.time()}-{random.random()}-dir_preview.mp4"
     clip = ImageSequenceClip(frames, fps=fps)
-    clip.write_videofile(str(video_file), codec="libx264", audio=False, verbose=False, logger=None)
+    try:
+        clip.write_videofile(
+            str(video_file),
+            codec="libx264",
+            audio=False,
+            verbose=False,
+            logger=None,
+            ffmpeg_params=["-pix_fmt", "yuv420p"],
+        )
+    except Exception:
+        video_file.unlink(missing_ok=True)
+        raise
+    finally:
+        clip.close()
     return str(video_file)
 
 
@@ -204,7 +261,7 @@ def load_current_video(video_state):
     video_path = video_state.get("video_path")
     if not video_path:
         gr.Warning("No video is selected.")
-        return None, None, None, ""
+        return None, None, None, None, None, ""
 
     first_frame = read_display_frames(video_path, n_frames=1)[0]
     video_state["origin_images"] = [first_frame]
@@ -213,7 +270,14 @@ def load_current_video(video_state):
         with torch.inference_mode(), autocast_context():
             video_state["click_inference_state"] = get_click_predictor().init_state(video_path=video_path)
 
-    return video_path, get_video_title(video_state["video_index"]), Image.fromarray(first_frame), ""
+    return (
+        video_path,
+        get_video_selector_label(video_state["video_index"]),
+        get_video_title(video_state["video_index"]),
+        Image.fromarray(first_frame),
+        None,
+        "",
+    )
 
 
 def load_initial_video(video_state):
@@ -225,6 +289,20 @@ def step_and_load_video(delta, video_state):
     current_idx = int(video_state.get("video_index", 0))
     set_current_video(current_idx + delta, video_state)
     return load_current_video(video_state)
+
+
+def select_video(video_choice, video_state):
+    if not video_choice:
+        gr.Warning("No video is selected.")
+        return None, None, None, None, None, ""
+
+    for video_idx in range(len(VIDEO_PATHS)):
+        if video_choice == get_video_selector_label(video_idx):
+            set_current_video(video_idx, video_state)
+            return load_current_video(video_state)
+
+    gr.Warning(f"Invalid video selection: {video_choice}")
+    return None, None, None, None, None, ""
 
 
 def switch_prompt_mode(prompt_mode, video_state):
@@ -345,49 +423,46 @@ def preview_text_query(query_text, video_state):
     video_state["origin_images"] = display_images
     video_state["query_text"] = prompt
 
-    output_frames = []
-    mask_frames = []
+    output_frames = [frame.copy() for frame in display_images]
+    mask_frames = [
+        np.zeros((frame.shape[0], frame.shape[1], 1), dtype=np.float32)
+        for frame in display_images
+    ]
 
     with torch.inference_mode(), autocast_context():
         inference_state = get_text_predictor().init_state(resource_path=video_path)
-        _, preview_outputs = get_text_predictor().add_prompt(
-            inference_state=inference_state,
-            frame_idx=0,
-            text_str=prompt,
-        )
-
-        first_mask = combine_output_masks(preview_outputs)
-        if first_mask is None:
+        seed_frame_idx, _ = find_text_query_seed_frame(inference_state, prompt)
+        if seed_frame_idx is None:
             video_state["text_inference_state"] = inference_state
-            gr.Warning(f'No mask was found on frame 0 for query "{prompt}".')
+            gr.Warning(f'No mask was found in any frame for query "{prompt}".')
             return Image.fromarray(display_images[0]), None, ""
 
-        for out_frame_idx, outputs in get_text_predictor().propagate_in_video(
-            inference_state=inference_state,
-            start_frame_idx=0,
-            max_frame_num_to_track=max(len(display_images) - 1, 0),
-            reverse=False,
-        ):
-            if out_frame_idx >= len(display_images):
-                break
+        for reverse in (False, True):
+            for out_frame_idx, outputs in get_text_predictor().propagate_in_video(
+                inference_state=inference_state,
+                start_frame_idx=seed_frame_idx,
+                max_frame_num_to_track=max(len(display_images) - 1, 0),
+                reverse=reverse,
+            ):
+                if out_frame_idx >= len(display_images):
+                    break
 
-            frame = display_images[out_frame_idx]
-            mask = combine_output_masks(outputs)
-            if mask is None:
-                display_mask = np.zeros(frame.shape[:2], dtype=np.float32)
-            else:
-                display_mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                frame = display_images[out_frame_idx]
+                mask = combine_output_masks(outputs)
+                if mask is None:
+                    display_mask = np.zeros(frame.shape[:2], dtype=np.float32)
+                else:
+                    display_mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-            mask_frames.append(display_mask[:, :, None])
-            output_frames.append(render_mask_overlay(frame, display_mask))
-
-    if not output_frames:
-        gr.Warning("Text prompting did not return any preview frames.")
-        return Image.fromarray(display_images[0]), None, ""
+                mask_frames[out_frame_idx] = display_mask[:, :, None]
+                output_frames[out_frame_idx] = render_mask_overlay(frame, display_mask)
 
     video_state["text_inference_state"] = inference_state
     video_state["masks"] = mask_frames
-    video_state["preview_video_path"] = write_preview_video(output_frames)
+    video_state["preview_video_path"] = write_preview_video(
+        output_frames,
+        fps=get_video_fps(video_path),
+    )
     return Image.fromarray(output_frames[0]), video_state["preview_video_path"], ""
 
 
@@ -452,6 +527,12 @@ with gr.Blocks() as demo:
     with gr.Column():
         current_video_title = gr.Textbox(label="Current Video", interactive=False)
         video_input = gr.Video(label="Selected Video", interactive=False, elem_id="my-video1")
+        video_selector = gr.Dropdown(
+            choices=get_video_selector_choices(),
+            value=get_video_selector_label(0),
+            label="Go To Video",
+            interactive=True,
+        )
 
         with gr.Row(elem_id="my-btn"):
             prev_video_btn = gr.Button("Previous Video")
@@ -512,17 +593,22 @@ with gr.Blocks() as demo:
         demo.load(
             fn=load_initial_video,
             inputs=[video_state],
-            outputs=[video_input, current_video_title, image_output, save_output],
+            outputs=[video_input, video_selector, current_video_title, image_output, video_output, save_output],
         )
         prev_video_btn.click(
             fn=lambda video_state: step_and_load_video(-1, video_state),
             inputs=[video_state],
-            outputs=[video_input, current_video_title, image_output, save_output],
+            outputs=[video_input, video_selector, current_video_title, image_output, video_output, save_output],
         )
         next_video_btn.click(
             fn=lambda video_state: step_and_load_video(1, video_state),
             inputs=[video_state],
-            outputs=[video_input, current_video_title, image_output, save_output],
+            outputs=[video_input, video_selector, current_video_title, image_output, video_output, save_output],
+        )
+        video_selector.change(
+            select_video,
+            inputs=[video_selector, video_state],
+            outputs=[video_input, video_selector, current_video_title, image_output, video_output, save_output],
         )
         prompt_mode.change(
             switch_prompt_mode,
@@ -560,9 +646,10 @@ with gr.Blocks() as demo:
             outputs=save_output,
         )
 
-demo.launch(
-    server_name="0.0.0.0",
-    server_port=8000,
-    share=True,
-    allowed_paths=[str(INPUT_CLIPS_DIR), str(GRADIO_TEMP_DIR)],
-)
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=8000,
+        share=True,
+        allowed_paths=[str(INPUT_CLIPS_DIR), str(GRADIO_TEMP_DIR)],
+    )
