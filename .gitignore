@@ -4,3 +4,4 @@ masks/
 sam3/
 __pycache__/
 gradio_temp_dir/
+data/
